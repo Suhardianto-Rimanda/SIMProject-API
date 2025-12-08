@@ -1,11 +1,11 @@
 from flask import request, jsonify
-from app.extensions import db
+from app.extensions import db  
 from app.models import Ingredient, Product, Recipe
 from app.decorators import admin_required
 from . import admin_bp
 
 # =====================================================
-# 1. CRUD BAHAN BAKU (INGREDIENTS)
+# 1. CRUD BAHAN BAKU (INGREDIENTS) - UPDATED (MULTI-UNIT)
 # =====================================================
 
 @admin_bp.route('/ingredients', methods=['POST'])
@@ -13,12 +13,20 @@ from . import admin_bp
 def create_ingredient():
     data = request.get_json()
     if not data.get('name') or not data.get('unit'):
-        return jsonify({'message': 'Nama dan Satuan wajib diisi!'}), 400
+        return jsonify({'message': 'Nama dan Satuan Dasar wajib diisi!'}), 400
 
     if Ingredient.query.filter_by(name=data['name']).first():
         return jsonify({'message': f"Bahan '{data['name']}' sudah ada!"}), 409
 
-    new_ing = Ingredient(name=data['name'], unit=data['unit'])
+    # Simpan data konversi (Default ke satuan dasar jika kosong)
+    new_ing = Ingredient(
+        name=data['name'],
+        unit=data['unit'],                                       # Satuan Resep (Gram)
+        purchase_unit=data.get('purchase_unit', data['unit']),   # Satuan Beli (Karung)
+        conversion_rate=data.get('conversion_rate', 1),          # 1 Karung = X Gram
+        current_stock=0,
+        avg_cost=0
+    )
     db.session.add(new_ing)
     db.session.commit()
     return jsonify({'message': 'Bahan baku berhasil ditambahkan', 'id': new_ing.id}), 201
@@ -26,13 +34,16 @@ def create_ingredient():
 @admin_bp.route('/ingredients', methods=['GET'])
 @admin_required()
 def get_ingredients():
-    items = Ingredient.query.all()
+    items = Ingredient.query.order_by(Ingredient.name).all()
     return jsonify([{
         'id': i.id, 
         'name': i.name, 
         'unit': i.unit, 
-        'stock': float(i.current_stock), 
-        'avg_cost': float(i.avg_cost)
+        # Gunakan 'or' untuk memberi nilai default jika database NULL
+        'purchase_unit': i.purchase_unit or i.unit, 
+        'conversion_rate': float(i.conversion_rate or 1), 
+        'stock': float(i.current_stock or 0), 
+        'avg_cost': float(i.avg_cost or 0)
     } for i in items]), 200
 
 @admin_bp.route('/ingredients/<int:id>', methods=['PUT'])
@@ -40,8 +51,12 @@ def get_ingredients():
 def update_ingredient(id):
     ing = Ingredient.query.get_or_404(id)
     data = request.get_json()
+    
     if 'name' in data: ing.name = data['name']
     if 'unit' in data: ing.unit = data['unit']
+    if 'purchase_unit' in data: ing.purchase_unit = data['purchase_unit']
+    if 'conversion_rate' in data: ing.conversion_rate = data['conversion_rate']
+    
     db.session.commit()
     return jsonify({'message': 'Bahan diperbarui'}), 200
 
@@ -55,8 +70,6 @@ def delete_ingredient(id):
     db.session.delete(ing)
     db.session.commit()
     return jsonify({'message': 'Bahan dihapus'}), 200
-
-
 # =====================================================
 # 2. CRUD PRODUK / MENU (PRODUCTS)
 # =====================================================

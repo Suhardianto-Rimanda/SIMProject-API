@@ -1,6 +1,10 @@
 from app.extensions import db
-from datetime import datetime
+from datetime import datetime, timedelta  # <--- Tambahkan timedelta
 
+
+
+def get_wib_now():
+    return datetime.utcnow() + timedelta(hours=7)
 # ==========================================
 # 1. TABEL AKTOR (USER & AUTH)
 # ==========================================
@@ -36,11 +40,23 @@ class Ingredient(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    unit = db.Column(db.String(20), nullable=False) # kg, gr, pcs
-    current_stock = db.Column(db.Numeric(10, 2), default=0)
-    avg_cost = db.Column(db.Numeric(15, 2), default=0) 
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 1. SATUAN DASAR (Dipakai di Resep & Stok Sistem)
+    # Contoh: 'gr', 'ml', 'pcs'
+    unit = db.Column(db.String(20), nullable=False) 
+    
+    # 2. SATUAN BELI (Tampilan saat Restock) [BARU]
+    # Contoh: 'Karung', 'Botol', 'Karton'
+    purchase_unit = db.Column(db.String(20), default='pcs') 
+    
+    # 3. RASIO KONVERSI [BARU]
+    # Contoh: 1 Karung = 25000 gr. Maka isinya: 25000
+    conversion_rate = db.Column(db.Numeric(10, 2), default=1) 
 
+    current_stock = db.Column(db.Numeric(10, 2), default=0) # Disimpan dalam 'unit' (gr/ml)
+    avg_cost = db.Column(db.Numeric(15, 2), default=0) # Harga per 'unit' (per gram)
+    
+    updated_at = db.Column(db.DateTime, default=get_wib_now, onupdate=get_wib_now)
     logs = db.relationship('InventoryLog', backref='ingredient', lazy=True)
 
 class Product(db.Model):
@@ -102,12 +118,18 @@ class Order(db.Model):
     # Link ke Shift (Wajib ada untuk pelaporan shift)
     session_id = db.Column(db.Integer, db.ForeignKey('sales_sessions.id'), nullable=True)
     
+    # === [BARU] STATUS ORDER UNTUK DAPUR ===
+    # Default 'pending' saat kasir input. Nanti diubah jadi 'cooking' atau 'completed'
+    status = db.Column(db.String(20), default='pending') 
+    
+
     total_amount = db.Column(db.Numeric(15, 2), nullable=False)
-    payment_method = db.Column(db.Enum('cash', 'qris', 'transfer'), default='cash')
+    # Tambahkan 'pending' ke dalam Enum
+    payment_method = db.Column(db.Enum('cash', 'qris', 'transfer', 'pending'), default='pending')
+    customer_name = db.Column(db.String(100), default='Pelanggan Umum')
     transaction_date = db.Column(db.DateTime, default=datetime.utcnow)
 
     items = db.relationship('OrderItem', backref='order', lazy=True)
-
 class OrderItem(db.Model):
     __tablename__ = 'order_items'
 

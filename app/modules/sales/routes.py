@@ -16,10 +16,17 @@ def sales_dashboard():
     active_session = SalesSession.query.filter_by(user_id=user_id, end_time=None).first()
     
     status = "Shift Aktif" if active_session else "Shift Belum Dibuka"
-    
+    session_info = None
+    if active_session:
+        session_info = {
+            "id": active_session.id,
+            "start_cash": float(active_session.start_cash),   # Modal Awal
+            "total_sales": float(active_session.total_system) # Omset Sementara
+        }
     return jsonify({
         "title": "KASIR / POS",
         "status": status,
+        "session_info": session_info,
         "menu": ["Buka Shift", "Input Transaksi", "Riwayat Penjualan", "Tutup Shift"]
     }), 200
 
@@ -71,7 +78,7 @@ def create_order():
     data = request.get_json()
     items_req = data.get('items') # Format: [{'product_id': 1, 'qty': 2}, ...]
     payment_method = data.get('payment_method', 'cash')
-
+    customer_name = data.get('customer_name', 'Pelanggan Umum')
     if not items_req:
         return jsonify({'message': 'Keranjang belanja kosong!'}), 400
 
@@ -85,7 +92,10 @@ def create_order():
             user_id=user_id,
             session_id=active_session.id,
             payment_method=payment_method,
-            total_amount=0 # Nanti diupdate
+            status='pending',
+            customer_name=customer_name,
+            total_amount=0, # Nanti diupdate
+            transaction_date=datetime.now()
         )
         db.session.add(new_order)
         db.session.flush() # Agar new_order.id terbentuk
@@ -145,19 +155,22 @@ def create_order():
         new_order.total_amount = total_amount
         
         # Update Total Penjualan di Shift ini
-        active_session.total_system = float(active_session.total_system) + total_amount
+        if payment_method != 'pending':
+            active_session.total_system = float(active_session.total_system) + total_amount
         
         db.session.commit() 
 
         return jsonify({
             'message': 'Transaksi berhasil!',
             'invoice': invoice_no,
-            'total': total_amount
+            'total': total_amount,
+            'customer': customer_name,
+            'date': new_order.transaction_date.strftime('%d-%m-%Y %H:%M')
         }), 201
 
     except Exception as e:
-        db.session.rollback() # Batalkan jika error
-        return jsonify({'message': f'Transaksi Gagal: {str(e)}'}), 400
+        db.session.rollback()
+        return jsonify({'message': f'Gagal: {str(e)}'}), 400
 
 # =====================================================
 # 3. CETAK STRUK (DATA)
@@ -170,7 +183,7 @@ def get_receipt(invoice_no):
     items_data = []
     for item in order.items:
         items_data.append({
-            'product': item.product.name,
+            'product': item.product.name, 
             'qty': item.quantity,
             'price': float(item.price_at_sale),
             'subtotal': float(item.price_at_sale) * item.quantity
@@ -181,6 +194,7 @@ def get_receipt(invoice_no):
         'invoice': order.invoice_no,
         'date': order.transaction_date.strftime('%Y-%m-%d %H:%M'),
         'cashier': order.cashier.username,
+        'customer': order.customer_name,
         'items': items_data,
         'total': float(order.total_amount),
         'payment': order.payment_method
@@ -255,3 +269,161 @@ def get_menu_list():
         'count': len(menu_data),
         'menu': menu_data
     }), 200
+    # =====================================================
+# 6. LIHAT PESANAN BELUM LUNAS (OPEN BILL)
+# =====================================================
+@sales_bp.route('/orders/pending', methods=['GET'])
+@cashier_required()
+def get_pending_orders():
+    # Ambil order yang payment_method nya 'pending' (belum bayar)
+    orders = Order.query.filter_by(payment_method='pending').order_by(Order.transaction_date.desc()).all()
+    
+    output = []
+    for o in orders:
+        output.append({
+            'invoice': o.invoice_no,
+            'customer': o.customer_name,    
+            'time': o.transaction_date.strftime('%H:%M'),
+            'total': float(o.total_amount),
+            'items_count': len(o.items)
+        })
+        
+    return jsonify(output), 200
+
+# =====================================================
+# 7. BAYAR TAGIHAN (PELUNASAN)
+# =====================================================
+@sales_bp.route('/orders/<string:invoice>/pay', methods=['POST'])
+@cashier_required()
+def pay_pending_order(invoice):
+    data = request.get_json()
+    method = data.get('payment_method', 'cash')
+    
+    order = Order.query.filter_by(invoice_no=invoice).first()
+    if not order:
+        return jsonify({'message': 'Invoice tidak ditemukan'}), 404
+        
+    if order.payment_method != 'pending':
+        return jsonify({'message': 'Pesanan ini sudah lunas!'}), 400
+        
+    # Update Status Pembayaran
+    order.payment_method = method
+    
+    # Update Total Sales di Session (Karena baru uang masuk sekarang)
+    if order.session_id:
+        session = SalesSession.query.get(order.session_id)
+        if session:
+            session.total_system = float(session.total_system) + float(order.total_amount)
+            
+    db.session.commit()
+    
+    return jsonify({'message': 'Pembayaran berhasil!', 'invoice': order.invoice_no}), 200
+# =====================================================
+# [BARU] REFUND / BATALKAN PESANAN
+# =====================================================
+@sales_bp.route('/orders/<string:invoice>/void', methods=['POST'])
+@cashier_required()
+def void_order(invoice):
+    user_id = get_jwt_identity()
+    order = Order.query.filter_by(invoice_no=invoice).first()
+    
+    if not order: return jsonify({'message': 'Invoice tidak ditemukan'}), 404
+    if order.status == 'cancelled': return jsonify({'message': 'Pesanan sudah dibatalkan sebelumnya'}), 400
+
+    try:
+        # 1. Tandai Order sebagai Cancelled
+        order.status = 'cancelled'
+        
+        # 2. Kembalikan Uang ke Shift (Jika sudah lunas)
+        if order.payment_method != 'pending' and order.session_id:
+            session = SalesSession.query.get(order.session_id)
+            if session:
+                session.total_system = float(session.total_system) - float(order.total_amount)
+
+        # 3. Kembalikan Stok Bahan Baku (Restoration)
+        for item in order.items:
+            recipes = Recipe.query.filter_by(product_id=item.product_id).all()
+            for r in recipes:
+                ingredient = r.ingredient
+                restore_qty = r.quantity_needed * item.quantity
+                
+                # Tambah stok balik
+                ingredient.current_stock += restore_qty
+                
+                # Catat Log Pengembalian
+                log = InventoryLog(
+                    ingredient_id=ingredient.id,
+                    user_id=user_id,
+                    change_type='adjustment', # Dianggap penyesuaian/pembatalan
+                    quantity_change=restore_qty
+                )
+                db.session.add(log)
+
+        db.session.commit()
+        return jsonify({'message': f'Transaksi {invoice} berhasil dibatalkan (Refund). Stok dikembalikan.'}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': f'Gagal Refund: {str(e)}'}), 500
+ # =====================================================
+# 8. DATA RIWAYAT TRANSAKSI (ALL TIME - LIMIT 50)
+# =====================================================
+@sales_bp.route('/orders/history', methods=['GET'])
+@cashier_required()
+def get_order_history():
+    # REVISI: Jangan filter 'today' agar data tidak hilang saat pergantian hari/jam server beda.
+    # Ambil 50 transaksi terakhir secara global.
+    
+    orders = Order.query.order_by(Order.transaction_date.desc()).limit(50).all()
+    
+    output = []
+    for o in orders:
+        output.append({
+            'invoice': o.invoice_no,
+            'customer': o.customer_name, 
+            'total': float(o.total_amount),
+            'status': o.status,
+            'payment': o.payment_method,
+            # Format tanggal lebih lengkap: Tgl-Blan Jam:Menit
+            'time': o.transaction_date.strftime('%d/%m %H:%M') 
+        })
+    return jsonify(output), 200
+# =====================================================
+# 9. HAPUS RIWAYAT TRANSAKSI (HARD DELETE)
+# =====================================================
+@sales_bp.route('/orders/<string:invoice>', methods=['DELETE'])
+@cashier_required()
+def delete_order_permanently(invoice):
+    order = Order.query.filter_by(invoice_no=invoice).first()
+    if not order: 
+        return jsonify({'message': 'Invoice tidak ditemukan'}), 404
+
+    try:
+        # A. KEMBALIKAN UANG KE SHIFT (Jika Lunas & Belum Cancel)
+        # Supaya omset hari ini tidak kelebihan
+        if order.payment_method != 'pending' and order.status != 'cancelled' and order.session_id:
+            session = SalesSession.query.get(order.session_id)
+            if session:
+                session.total_system = float(session.total_system) - float(order.total_amount)
+
+        # B. KEMBALIKAN STOK (Jika Belum Cancel)
+        # Jika status 'cancelled', stok sudah dikembalikan saat void, jadi skip langkah ini.
+        if order.status != 'cancelled':
+            for item in order.items:
+                recipes = Recipe.query.filter_by(product_id=item.product_id).all()
+                for r in recipes:
+                    ingredient = r.ingredient
+                    restore_qty = r.quantity_needed * item.quantity
+                    ingredient.current_stock += restore_qty # Balikin stok
+
+        # C. HAPUS DATA PERMANEN
+        # Hapus item dulu (child), baru order (parent)
+        OrderItem.query.filter_by(order_id=order.id).delete()
+        db.session.delete(order)
+        db.session.commit()
+
+        return jsonify({'message': 'Data transaksi berhasil dihapus permanen.'}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': f'Gagal hapus: {str(e)}'}), 500

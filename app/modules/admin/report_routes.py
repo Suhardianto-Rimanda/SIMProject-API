@@ -1,25 +1,22 @@
 from flask import request, jsonify
 from sqlalchemy import func
-from datetime import datetime
+from datetime import datetime, time
 from app.extensions import db
 from app.models import Ingredient, Order, OrderItem, OperationalExpense
 from app.decorators import admin_required
 from . import admin_bp
 
 # =====================================================
-# 1. LAPORAN STOK (Asset Value)
+# 1. LAPORAN STOK (Asset Value) - TIDAK ADA PERUBAHAN (SUDAH BENAR)
 # =====================================================
 @admin_bp.route('/reports/stock', methods=['GET'])
 @admin_required()
 def report_stock():
-    # Mengambil semua bahan
     items = Ingredient.query.all()
-    
     output = []
     total_asset_value = 0
     
     for i in items:
-        # Hitung nilai aset (Stok x Harga Rata-rata)
         asset_value = float(i.current_stock) * float(i.avg_cost)
         total_asset_value += asset_value
         
@@ -34,17 +31,16 @@ def report_stock():
     return jsonify({
         'title': 'Laporan Nilai Aset Stok',
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'total_asset_value': total_asset_value, # Total uang yang mengendap di gudang
+        'total_asset_value': total_asset_value,
         'items': output
     }), 200
 
 # =====================================================
-# 2. LAPORAN PENJUALAN (Sales Recap)
+# 2. LAPORAN PENJUALAN (Sales Recap) - LOGIC FIX (WIB)
 # =====================================================
 @admin_bp.route('/reports/sales', methods=['GET'])
 @admin_required()
 def report_sales():
-    # Ambil filter tanggal dari URL (contoh: ?start_date=2023-01-01&end_date=2023-01-31)
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
     
@@ -53,14 +49,27 @@ def report_sales():
         func.count(Order.id).label('total_trx'),
         func.sum(Order.total_amount).label('total_revenue')
     )
-    
-    # Filter Tanggal (Jika ada)
+
+    # 1. FILTER STATUS VALID (Hanya Lunas & Tidak Batal)
+    query = query.filter(Order.status != 'cancelled')
+    query = query.filter(Order.payment_method != 'pending')
+
+    # 2. FILTER TANGGAL (WIB RANGE 00:00 - 23:59)
+    # Ini kuncinya agar data hari ini terbaca
     if start_date_str and end_date_str:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
-        query = query.filter(func.date(Order.transaction_date).between(start_date, end_date))
+        # Konversi string ke object Date
+        start_date_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_date_obj = datetime.strptime(end_date_str, '%Y-%m-%d')
         
-    # Group by Tanggal
+        # Buat Range Jam Lengkap (WIB)
+        start_full = datetime.combine(start_date_obj, time.min) # 00:00:00
+        end_full = datetime.combine(end_date_obj, time.max)     # 23:59:59
+        
+        # Filter berdasarkan kolom DateTime langsung (Lebih Akurat)
+        query = query.filter(Order.transaction_date >= start_full)
+        query = query.filter(Order.transaction_date <= end_full)
+        
+    # Grouping tetap by Date untuk grafik
     sales_data = query.group_by(func.date(Order.transaction_date)).all()
     
     output = []
@@ -82,7 +91,7 @@ def report_sales():
     }), 200
 
 # =====================================================
-# 3. LAPORAN LABA RUGI (Profit & Loss) - INTI ERP
+# 3. LAPORAN LABA RUGI (Profit & Loss) - LOGIC FIX (WIB)
 # =====================================================
 @admin_bp.route('/reports/profit-loss', methods=['GET'])
 @admin_required()
@@ -90,36 +99,53 @@ def report_profit_loss():
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
     
-    # A. Hitung OMZET (Revenue) & HPP (COGS)
-    query = db.session.query(
-        func.sum(OrderItem.quantity * OrderItem.price_at_sale).label('revenue'),
-        func.sum(OrderItem.quantity * OrderItem.cogs_at_sale).label('cogs')
-    ).join(Order, OrderItem.order_id == Order.id)
-    
-    # Filter Biaya Operasional
-    expense_query = db.session.query(func.sum(OperationalExpense.amount))
-    
+    # 1. SETUP FILTER TANGGAL (WIB Range)
+    start_full = None
+    end_full = None
+    start_d_obj = None # Untuk operational expense
+    end_d_obj = None
+
     if start_date_str and end_date_str:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+        start_d_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_d_obj = datetime.strptime(end_date_str, '%Y-%m-%d')
         
-        query = query.filter(func.date(Order.transaction_date).between(start_date, end_date))
-        expense_query = expense_query.filter(OperationalExpense.expense_date.between(start_date, end_date))
-        
-    result = query.first()
+        start_full = datetime.combine(start_d_obj, time.min) # 00:00:00
+        end_full = datetime.combine(end_d_obj, time.max)     # 23:59:59
+
+    # 2. HITUNG OMZET (Revenue)
+    # Filter Status & Payment
+    rev_query = db.session.query(func.sum(Order.total_amount))\
+        .filter(Order.status != 'cancelled')\
+        .filter(Order.payment_method != 'pending')
     
-    # Ambil nilai expense, default 0 jika None
-    raw_total_expense = expense_query.scalar() or 0 
+    # Filter Waktu
+    if start_full:
+        rev_query = rev_query.filter(Order.transaction_date >= start_full, Order.transaction_date <= end_full)
     
-    # <--- PERBAIKAN DI SINI: Ubah Decimal ke Float
-    total_expense = float(raw_total_expense)
+    revenue = float(rev_query.scalar() or 0)
+
+    # 3. HITUNG HPP (COGS)
+    # Join Order agar bisa filter status transaksi
+    cogs_query = db.session.query(func.sum(OrderItem.quantity * OrderItem.cogs_at_sale))\
+        .join(Order)\
+        .filter(Order.status != 'cancelled')\
+        .filter(Order.payment_method != 'pending')
+
+    if start_full:
+        cogs_query = cogs_query.filter(Order.transaction_date >= start_full, Order.transaction_date <= end_full)
+
+    cogs = float(cogs_query.scalar() or 0)
+
+    # 4. HITUNG BIAYA OPERASIONAL
+    # Menggunakan filter tanggal (Date) karena expense_date bertipe Date (bukan DateTime)
+    exp_query = db.session.query(func.sum(OperationalExpense.amount))
+    if start_d_obj:
+        exp_query = exp_query.filter(OperationalExpense.expense_date >= start_d_obj, OperationalExpense.expense_date <= end_d_obj)
     
-    revenue = float(result.revenue or 0)
-    cogs = float(result.cogs or 0)
-    
+    total_expense = float(exp_query.scalar() or 0)
+
+    # 5. KALKULASI HASIL
     gross_profit = revenue - cogs
-    
-    # Sekarang pengurangan aman karena keduanya Float
     net_profit = gross_profit - total_expense
     
     return jsonify({
@@ -133,8 +159,9 @@ def report_profit_loss():
             '5. LABA BERSIH (Net Profit)': net_profit
         }
     }), 200
+
 # =====================================================
-# TAMBAHAN: Input Biaya Operasional (Agar P&L Lengkap)
+# TAMBAHAN: Input Biaya Operasional
 # =====================================================
 @admin_bp.route('/expenses', methods=['POST'])
 @admin_required()

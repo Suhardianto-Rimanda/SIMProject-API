@@ -44,9 +44,10 @@ def get_stocks():
     output = []
     
     for item in ingredients:
-        status = "Aman"
-        qty = float(item.current_stock)
+        # [FIX 1] Pakai 'or 0' agar tidak error jika database NULL
+        qty = float(item.current_stock or 0)
         
+        status = "Aman"
         if qty <= 0:
             status = "HABIS!"
         elif qty < 5: 
@@ -57,12 +58,21 @@ def get_stocks():
             'name': item.name,
             'stock': qty,
             'unit': item.unit,
-            'avg_cost': float(item.avg_cost),
-            'status': status
+            # [FIX 2] Handle harga NULL
+            'avg_cost': float(item.avg_cost or 0),
+            'status': status,
+            
+            # [FIX 3] Masukkan Data Konversi (PENTING untuk Frontend Baru)
+            'purchase_unit': item.purchase_unit or item.unit,
+            'conversion_rate': float(item.conversion_rate or 1)
         })
         
-    return jsonify({'timestamp': datetime.now(), 'count': len(output), 'data': output}), 200
-
+    # Return Sesuai Struktur Anda
+    return jsonify({
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+        'count': len(output), 
+        'data': output 
+    }), 200
 # =====================================================
 # 1.B. DAFTAR BAHAN (SIMPLE LIST UNTUK DROPDOWN)
 # =====================================================
@@ -170,30 +180,73 @@ def adjust_stock():
         'current_stock': float(ingredient.current_stock),
         'change_type': change_type
     }), 200
-
 # =====================================================
-# 4. ANTRIAN MASAK (PRODUCTION QUEUE)
+# 4. ANTRIAN MASAK (PRODUCTION QUEUE) - REVISI ID
 # =====================================================
 @production_bp.route('/queue', methods=['GET'])
 @kitchen_required()
 def production_queue():
-    today = date.today()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    
-    orders = Order.query.filter(Order.transaction_date >= start_of_day).all()
+    # Ambil hanya yang belum selesai (Pending / Cooking)
+    orders = Order.query.filter(
+        Order.status.in_(['pending', 'cooking'])
+    ).order_by(Order.transaction_date.asc()).all()
     
     kitchen_tasks = {}
     
     for order in orders:
         for item in order.items:
             menu_name = item.product.name
+            
             if menu_name not in kitchen_tasks:
-                kitchen_tasks[menu_name] = {'total_qty': 0, 'orders': []}
+                kitchen_tasks[menu_name] = {
+                    'total_qty': 0, 
+                    'orders': [] # Sekarang list of objects, bukan string doang
+                }
             
             kitchen_tasks[menu_name]['total_qty'] += item.quantity
-            kitchen_tasks[menu_name]['orders'].append(order.invoice_no)
+            
+            # Cek duplikasi di list (agar 1 invoice tidak muncul 2x di menu yg sama)
+            exists = False
+            for o in kitchen_tasks[menu_name]['orders']:
+                if o['id'] == order.id:
+                    exists = True
+                    break
+            
+            if not exists:
+                kitchen_tasks[menu_name]['orders'].append({
+                    'id': order.id,           # PENTING: Untuk tombol klik
+                    'invoice': order.invoice_no,
+                    'status': order.status,
+                    'customer': order.customer_name # PENTING: Untuk warna tombol
+                })
     
     return jsonify({
-        'date': today.strftime('%Y-%m-%d'),
+        'date': date.today().strftime('%Y-%m-%d'),
         'tasks': kitchen_tasks
+    }), 200
+# =====================================================
+# 5. UPDATE STATUS MASAKAN (KITCHEN ACTION)
+# =====================================================
+@production_bp.route('/orders/<int:order_id>/status', methods=['PUT'])
+@kitchen_required()
+def update_order_status(order_id):
+    data = request.get_json()
+    new_status = data.get('status') # 'cooking' atau 'completed'
+
+    # Validasi status yang diperbolehkan
+    if new_status not in ['pending', 'cooking', 'completed']:
+        return jsonify({'message': 'Status tidak valid'}), 400
+
+    order = Order.query.get(order_id)
+    if not order:
+        return jsonify({'message': 'Order tidak ditemukan'}), 404
+
+    # Update Status
+    order.status = new_status
+    db.session.commit()
+
+    return jsonify({
+        'message': f'Status order #{order.invoice_no} diubah menjadi {new_status}',
+        'order_id': order.id,
+        'status': order.status
     }), 200
